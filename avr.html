@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>AVR Flash Tool (WebSerial Bitbanging)</title>
+    <style>
+        body { font-family: monospace; background: #111; color: #eee; margin: 0; padding: 0; }
+        .main { max-width: 700px; margin: 40px auto; background: #222; padding: 2em; border-radius: 12px; box-shadow: 0 0 12px #000; }
+        h1 { font-size: 1.4em; }
+        label { display: inline-block; width: 110px; margin-top: 0.5em; }
+        select, input[type="file"], input[type="number"] { margin-bottom: 1em; }
+        button { margin: 0.5em 0.5em 0.5em 0; background: #444; color: #fff; border: 1px solid #888; padding: 0.3em 1.5em; border-radius: 4px;}
+        button:disabled { background: #222; color: #777;}
+        #log { background: #181818; color: #d8fdaf; font-size: 0.96em; padding: 1em; height: 200px; overflow-y: auto; border-radius: 6px; margin-top: 1em;}
+        .row { margin-bottom: 0.8em; }
+        .pinmap { font-size: 0.9em; color: #fc7; }
+    </style>
+</head>
+<body>
+<div class="main">
+    <h1>AVR Flash Tool (WebSerial-Bitbanging SPI-ISP)</h1>
+    <div class="row">
+        <button id="connectBtn">🔌 Verbinden</button>
+        <span id="status">Nicht verbunden</span>
+    </div>
+    <div class="row">
+        <label for="chip">AVR:</label>
+        <select id="chip"></select>
+    </div>
+    <div class="row">
+        <label>HEX-Datei:</label>
+        <input type="file" id="hexfile" accept=".hex">
+        <span id="hexinfo"></span>
+    </div>
+    <div class="row pinmap">
+        <b>RS232 Mapping (Adapter ↔ AVR):</b><br>
+        MOSI: <select id="mosiPin"></select> &nbsp;
+        MISO: <select id="misoPin"></select> &nbsp;
+        SCK: <select id="sckPin"></select> &nbsp;
+        RESET: <select id="resetPin"></select>
+    </div>
+    <div class="row">
+        <button id="flashBtn" disabled>Flashen</button>
+        <button id="readBtn" disabled>Lesen</button>
+        <button id="fuseReadBtn" disabled>Fuses lesen</button>
+        <button id="fuseWriteBtn" disabled>Fuses schreiben</button>
+        <label>Low:</label><input type="number" min="0" max="255" id="fuseLow" size="4" value="0">
+        <label>High:</label><input type="number" min="0" max="255" id="fuseHigh" size="4" value="0">
+    </div>
+    <div class="row">
+        <div id="log"></div>
+    </div>
+</div>
+<script>
+/* -------- AVR Flash Tool Logic -------- */
+
+// --------- Pin Mapping & Definitions ---------
+const RS232_OUT = [
+    {name: 'RTS', set: 'rts', get: null},
+    {name: 'DTR', set: 'dtr', get: null},
+    {name: 'TXD', set: null, get: null}, // Out only, keine WebSerial Steuerung, evt. später
+];
+const RS232_IN = [
+    {name: 'CTS', get: 'clearToSend'},
+    {name: 'DSR', get: 'dataSetReady'},
+    {name: 'DCD', get: 'dataCarrierDetect'},
+    {name: 'RI',  get: 'ringIndicator'},
+];
+const ALL_PINS = [
+    ...RS232_OUT, ...RS232_IN
+];
+
+// --------- AVR Chip Definitions (erweiterbar) ---------
+const AVRS = [
+    {
+        name: "ATmega328P",
+        signature: [0x1E, 0x95, 0x0F],
+        flashSize: 32 * 1024,
+        pageSize: 128,
+        fuseDefault: {low: 0x62, high: 0xD9},
+        desc: "UNO, Nano, Pro Mini..."
+    },
+    {
+        name: "ATmega8",
+        signature: [0x1E, 0x93, 0x07],
+        flashSize: 8 * 1024,
+        pageSize: 64,
+        fuseDefault: {low: 0xE1, high: 0xD9},
+        desc: "Klassiker"
+    },
+    {
+        name: "ATtiny13",
+        signature: [0x1E, 0x90, 0x07],
+        flashSize: 1 * 1024,
+        pageSize: 32,
+        fuseDefault: {low: 0x6A, high: 0xFF},
+        desc: "Klein aber fein"
+    },
+    // Mehr hinzufügen…
+];
+
+// --------- Globals ---------
+let port, selectedAVR = AVRS[0];
+let signalMap = {};
+let signals = {};
+let hexData = [];
+let logEl = document.getElementById("log");
+
+// --------- UI Setup ---------
+function log(msg, cls="") {
+    logEl.innerHTML += `<div class="${cls}">${msg}</div>`;
+    logEl.scrollTop = logEl.scrollHeight;
+}
+function clearLog() { logEl.innerHTML = ""; }
+function setStatus(txt) { document.getElementById("status").textContent = txt; }
+
+function setupUI() {
+    // Populate chip select
+    let chipSel = document.getElementById("chip");
+    AVRS.forEach((c,i) => {
+        let opt = document.createElement("option");
+        opt.value = i; opt.text = `${c.name} (${c.desc})`;
+        chipSel.appendChild(opt);
+    });
+    chipSel.onchange = () => { selectedAVR = AVRS[chipSel.value]; };
+    // Pin selects
+    RS232_OUT.forEach((p,i) => {
+        document.getElementById("mosiPin").appendChild(new Option(p.name,i));
+        document.getElementById("sckPin").appendChild(new Option(p.name,i));
+        document.getElementById("resetPin").appendChild(new Option(p.name,i));
+    });
+    RS232_IN.forEach((p,i) => {
+        document.getElementById("misoPin").appendChild(new Option(p.name,i));
+    });
+    // File
+    document.getElementById("hexfile").onchange = e => {
+        let f = e.target.files[0];
+        if (!f) return;
+        let reader = new FileReader();
+        reader.onload = e2 => {
+            try {
+                hexData = parseHex(e2.target.result);
+                document.getElementById("hexinfo").textContent = `(${hexData.length} Bytes geladen)`;
+                log(`HEX geladen (${hexData.length} Bytes)`);
+            } catch (e) {
+                log("HEX Fehler: "+e, "err");
+            }
+        };
+        reader.readAsText(f);
+    };
+}
+setupUI();
+
+// --------- Serial Handling ---------
+async function connectSerial() {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+    setStatus("Verbunden!");
+    log("Serielle Verbindung steht.");
+    document.getElementById("flashBtn").disabled = false;
+    document.getElementById("readBtn").disabled = false;
+    document.getElementById("fuseReadBtn").disabled = false;
+    document.getElementById("fuseWriteBtn").disabled = false;
+}
+document.getElementById("connectBtn").onclick = connectSerial;
+
+// --------- RS232 Bitbang SPI ---------
+function getPinSel(id) {
+    let el = document.getElementById(id);
+    let idx = +el.value;
+    return RS232_OUT[idx]?.set || RS232_IN[idx]?.get;
+}
+
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+
+async function setLines({mosi, sck, reset}) {
+    // Only for output pins
+    let signals = {};
+    if (signalMap.mosi) signals[signalMap.mosi] = mosi;
+    if (signalMap.sck) signals[signalMap.sck] = sck;
+    if (signalMap.reset) signals[signalMap.reset] = reset;
+    await port.setSignals(signals);
+}
+
+async function readMISO() {
+    let sigs = await port.getSignals();
+    return sigs[signalMap.miso] ? 1 : 0;
+}
+
+// Prepare mapping for session
+function setupPinmap() {
+    signalMap.mosi  = RS232_OUT[document.getElementById("mosiPin").value].set;
+    signalMap.sck   = RS232_OUT[document.getElementById("sckPin").value].set;
+    signalMap.reset = RS232_OUT[document.getElementById("resetPin").value].set;
+    signalMap.miso  = RS232_IN[document.getElementById("misoPin").value].get;
+}
+document.getElementById("mosiPin").onchange = setupPinmap;
+document.getElementById("sckPin").onchange = setupPinmap;
+document.getElementById("resetPin").onchange = setupPinmap;
+document.getElementById("misoPin").onchange = setupPinmap;
+setupPinmap();
+
+// --------- SPI Transfer ---------
+async function spiTransfer(byteOut) {
+    let inByte = 0;
+    for (let i = 7; i >= 0; i--) {
+        await setLines({mosi: ((byteOut>>i)&1), sck: 0, reset: 1});
+        await sleep(2);
+        await setLines({mosi: ((byteOut>>i)&1), sck: 1, reset: 1});
+        await sleep(2);
+        let miso = await readMISO();
+        inByte = (inByte << 1) | miso;
+        await setLines({mosi: ((byteOut>>i)&1), sck: 0, reset: 1});
+        await sleep(2);
+    }
+    return inByte;
+}
+
+// --------- HEX Parsing ---------
+function parseHex(str) {
+    let lines = str.trim().split(/\r?\n/);
+    let data = [];
+    for (let l of lines) {
+        if (!l.startsWith(":")) continue;
+        let len = parseInt(l.substr(1,2),16);
+        let addr = parseInt(l.substr(3,4),16);
+        let type = parseInt(l.substr(7,2),16);
+        let d = l.substr(9, len*2);
+        if (type === 0) { // data
+            for (let i=0;i<len;i++) {
+                data[addr+i] = parseInt(d.substr(i*2,2),16);
+            }
+        }
+    }
+    // Löcher mit 0xFF auffüllen:
+    let max = data.length;
+    for (let i=0; i<max; i++) if (typeof data[i]==='undefined') data[i]=0xFF;
+    return data;
+}
+
+// --------- AVR ISP Protokoll ---------
+async function avrEnterProgmode() {
+    // RESET low für 20ms, dann high und direkt Befehl schicken
+    log("AVR: Reset auf LOW (Programmiermodus) ...");
+    await setLines({mosi: 0, sck: 0, reset: 0});
+    await sleep(30);
+    await setLines({mosi: 0, sck: 0, reset: 1});
+    await sleep(20);
+
+    // Sende SPI: 0xAC 0x53 0x00 0x00, als Antwort muss 0x53 kommen
+    let r = [];
+    r[0] = await spiTransfer(0xAC);
+    r[1] = await spiTransfer(0x53);
+    r[2] = await spiTransfer(0x00);
+    r[3] = await spiTransfer(0x00);
+    log(`AVR: Enter Programming Mode Antwort: ${r.map(x=>x.toString(16).padStart(2,"0")).join(" ")}`);
+    if (r[2] !== 0x53) throw "AVR nicht im ISP-Modus!";
+}
+
+async function avrReadSignature() {
+    let sig = [];
+    for (let i=0;i<3;i++) {
+        await spiTransfer(0x30);
+        await spiTransfer(0x00);
+        await spiTransfer(i);
+        sig[i] = await spiTransfer(0x00);
+    }
+    log(`Chip-ID: ${sig.map(x=>x.toString(16).padStart(2,"0")).join(" ")} (${matchAVR(sig)})`);
+    return sig;
+}
+function matchAVR(sig) {
+    let s = sig.map(x=>x.toString(16));
+    let f = AVRS.find(avr=>avr.signature.map(x=>x.toString(16)).join()===s.join());
+    return f ? f.name : "Unbekannt";
+}
+
+async function avrReadFuse(idx) {
+    let cmd = [0x50, 0x00, idx ? 0x08 : 0x00, 0x00]; // 0x50: low, 0x58: high
+    let r = [];
+    r[0] = await spiTransfer(cmd[0]);
+    r[1] = await spiTransfer(cmd[1]);
+    r[2] = await spiTransfer(cmd[2]);
+    r[3] = await spiTransfer(cmd[3]);
+    return r[3];
+}
+async function avrWriteFuse(idx, value) {
+    let cmd = [idx ? 0xAC : 0xA0, 0xA0, idx ? 0xA8 : 0xA0, value];
+    for (let i=0;i<4;i++) await spiTransfer(cmd[i]);
+    await sleep(10);
+}
+async function avrReadFlash(addr) {
+    // Read pageweise oder byteweise
+    let lo = addr & 0xFF, hi = (addr>>8) & 0xFF;
+    await spiTransfer(0x20); // Read low
+    await spiTransfer(hi);
+    await spiTransfer(lo);
+    let low = await spiTransfer(0x00);
+    await spiTransfer(0x28); // Read high
+    await spiTransfer(hi);
+    await spiTransfer(lo);
+    let high = await spiTransfer(0x00);
+    return [low, high];
+}
+async function avrWriteFlashPage(pageAddr, pageData) {
+    // Für kurze Demo: Write pageweise
+    for (let i=0;i<pageData.length;i+=2) {
+        await spiTransfer(0x40); // Load low
+        await spiTransfer((pageAddr>>8)&0xFF);
+        await spiTransfer((i/2)&0xFF);
+        await spiTransfer(pageData[i]);
+        await spiTransfer(0x48); // Load high
+        await spiTransfer((pageAddr>>8)&0xFF);
+        await spiTransfer((i/2)&0xFF);
+        await spiTransfer(pageData[i+1]);
+    }
+    // Page write
+    await spiTransfer(0x4C);
+    await spiTransfer((pageAddr>>8)&0xFF);
+    await spiTransfer(0x00);
+    await spiTransfer(0x00);
+    await sleep(10);
+}
+
+// --------- UI Actions ---------
+document.getElementById("flashBtn").onclick = async ()=>{
+    clearLog(); setupPinmap();
+    try {
+        await avrEnterProgmode();
+        let sig = await avrReadSignature();
+        log("Flash-Vorgang gestartet...");
+        // Flashen (pageweise)
+        let ps = selectedAVR.pageSize;
+        for (let i=0; i<hexData.length; i+=ps) {
+            let page = hexData.slice(i,i+ps);
+            await avrWriteFlashPage(i, page);
+            log(`Page ${i/ps} geschrieben`);
+        }
+        log("Flashen abgeschlossen!");
+    } catch(e) {
+        log("Fehler: "+e, "err");
+    }
+};
+document.getElementById("fuseReadBtn").onclick = async ()=>{
+    clearLog(); setupPinmap();
+    try {
+        await avrEnterProgmode();
+        let low = await avrReadFuse(0), high = await avrReadFuse(1);
+        log(`Fuses gelesen: LOW=0x${low.toString(16)}, HIGH=0x${high.toString(16)}`);
+        document.getElementById("fuseLow").value = low;
+        document.getElementById("fuseHigh").value = high;
+    } catch(e) { log("Fehler: "+e, "err"); }
+};
+document.getElementById("fuseWriteBtn").onclick = async ()=>{
+    clearLog(); setupPinmap();
+    let low = parseInt(document.getElementById("fuseLow").value), high = parseInt(document.getElementById("fuseHigh").value);
+    try {
+        await avrEnterProgmode();
+        await avrWriteFuse(0, low);
+        await avrWriteFuse(1, high);
+        log("Fuses geschrieben!");
+    } catch(e) { log("Fehler: "+e, "err"); }
+};
+document.getElementById("readBtn").onclick = async ()=>{
+    clearLog(); setupPinmap();
+    try {
+        await avrEnterProgmode();
+        log("Flash-Inhalt lesen...");
+        let out = [];
+        for (let i=0; i<selectedAVR.flashSize; i+=2) {
+            let [lo, hi] = await avrReadFlash(i/2);
+            out.push(lo, hi);
+        }
+        log("Flash gelesen ("+out.length+" Bytes)");
+        // Download als HEX:
+        let hex = makeHex(out);
+        let blob = new Blob([hex], {type:"text/plain"});
+        let a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "avr_dump.hex";
+        a.click();
+    } catch(e) { log("Fehler: "+e, "err"); }
+};
+function makeHex(data) {
+    let lines = [];
+    for (let i=0; i<data.length; i+=16) {
+        let chunk = data.slice(i,i+16);
+        let line = `:${chunk.length.toString(16).padStart(2,"0")}${(i).toString(16).padStart(4,"0")}00`;
+        let cs = chunk.length + ((i>>8)&0xFF) + (i&0xFF);
+        chunk.forEach(b=>{ line+=b.toString(16).padStart(2,"0"); cs+=b; });
+        cs = ((~cs+1)&0xFF);
+        line += cs.toString(16).padStart(2,"0");
+        lines.push(line.toUpperCase());
+    }
+    lines.push(":00000001FF");
+    return lines.join("\n");
+}
+</script>
+</body>
+</html>

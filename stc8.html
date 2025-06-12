@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>STC8G/H Flash Tool (WebSerial)</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; }
+    .log { background: #111; color: #0f0; font-family: monospace; padding: 1em; height: 300px; overflow-y: auto; margin-bottom: 1em;}
+    .btn { margin: 0.2em 0; padding: 0.4em 1.5em; }
+    input[type="file"] { margin-bottom: 1em; }
+  </style>
+</head>
+<body>
+<h2>STC8G/H Flash Tool (WebSerial)</h2>
+<div>
+  <button class="btn" id="btn-port">Port öffnen</button>
+  <span id="portname"></span>
+</div>
+<div>
+  <input type="file" id="binfile" accept=".bin">
+  <span id="filesize"></span>
+</div>
+<div>
+  <button class="btn" id="btn-flash" disabled>Flashen!</button>
+</div>
+<div class="log" id="log"></div>
+
+<script>
+// ----- Konstanten (wie im Python-Tool) -----
+const STC_PAGE_SIZE      = 128;
+
+const STC_CHAR_SYNC      = 0x7f;
+const STC_PREFIX         = 0x46;
+const STC_BREAK          = 0x5a;
+const STC_SUFFIX         = 0x16;
+const STC_TX_CODE        = 0x6a;
+const STC_RX_CODE        = 0x68;
+const STC_RPL_INFO       = 0x50;
+
+const STC_CMD_BAUD_SET   = 0x01;
+const STC_CMD_BAUD_CHECK = 0x05;
+const STC_CMD_ERASE      = 0x03;
+const STC_CMD_WRITE      = 0x22;
+const STC_CMD_WRITE_CONT = 0x02;
+const STC_CMD_EXIT       = 0xff;
+
+const DEVICES = [
+    {name:'STC8H1K16',id:0xF721,flash_size:16384},
+    {name:'STC8H1K20',id:0xF722,flash_size:20480},
+    {name:'STC8H1K24',id:0xF723,flash_size:24576},
+    {name:'STC8H1K28',id:0xF724,flash_size:28672},
+    {name:'STC8H1K33',id:0xF725,flash_size:33792},
+    {name:'STC8H1K02',id:0xF731,flash_size:2048},
+    {name:'STC8H1K04',id:0xF732,flash_size:4096},
+    {name:'STC8H1K06',id:0xF733,flash_size:6144},
+    {name:'STC8H1K08',id:0xF734,flash_size:8192},
+    {name:'STC8H1K10',id:0xF735,flash_size:10240},
+    {name:'STC8H1K12',id:0xF736,flash_size:12288},
+    {name:'STC8H1K17',id:0xF737,flash_size:17408},
+    {name:'STC8G1K02-20/16P',id:0xF751,flash_size:2048},
+    {name:'STC8G1K04-20/16P',id:0xF752,flash_size:4096},
+    {name:'STC8G1K06-20/16P',id:0xF753,flash_size:6144},
+    {name:'STC8G1K08-20/16P',id:0xF754,flash_size:8192},
+    {name:'STC8G1K10-20/16P',id:0xF755,flash_size:10240},
+    {name:'STC8G1K12-20/16P',id:0xF756,flash_size:12288},
+    {name:'STC8G1K17-20/16P',id:0xF757,flash_size:17408},
+    // (kannst du beliebig erweitern!)
+];
+
+// ----- GUI Elemente -----
+const log = document.getElementById('log');
+const btnPort = document.getElementById('btn-port');
+const btnFlash = document.getElementById('btn-flash');
+const binfile = document.getElementById('binfile');
+const portname = document.getElementById('portname');
+const filesize = document.getElementById('filesize');
+
+let port = null, reader = null, writer = null;
+let firmware = null;
+let device = null;
+let flash_size = 0;
+
+// ----- Logging -----
+function logMsg(msg, color="") {
+  log.innerHTML += `<div style="color:${color}">${msg}</div>`;
+  log.scrollTop = log.scrollHeight;
+}
+
+// ----- WebSerial Setup -----
+async function openPort() {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 2400, parity: 'even', dataBits: 8, stopBits: 1 });
+    portname.innerText = "Port offen";
+    logMsg("Port geöffnet. Bitte MCU mit Strom versorgen!", "#0ff");
+    writer = port.writable.getWriter();
+    reader = port.readable.getReader();
+    btnFlash.disabled = false;
+  } catch(e) {
+    logMsg("Port öffnen fehlgeschlagen: " + e, "#f00");
+  }
+}
+
+// Byte-Array schreiben
+async function serialWrite(data) {
+  await writer.write(data);
+}
+
+// Bytes lesen (exakt nBytes!)
+async function serialRead(nBytes) {
+  let out = new Uint8Array();
+  while (out.length < nBytes) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) {
+      let tmp = new Uint8Array(out.length + value.length);
+      tmp.set(out, 0);
+      tmp.set(value, out.length);
+      out = tmp;
+    }
+  }
+  return out;
+}
+
+// ----- Dateiupload -----
+binfile.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const fr = new FileReader();
+  fr.onload = ev => {
+    firmware = new Uint8Array(ev.target.result);
+    filesize.innerText = `(${firmware.length} Bytes geladen)`;
+    logMsg(`Firmware geladen: ${file.name} (${firmware.length} Bytes)`, "#ff0");
+  };
+  fr.readAsArrayBuffer(file);
+});
+
+// ----- Protokoll-Hilfen -----
+function u16(b1, b2) { return (b1 << 8) | b2; }
+
+function checksum(arr) {
+  // arr: Uint8Array
+  let sum = STC_TX_CODE + ((arr.length+6)>>8) + ((arr.length+6)&0xff);
+  for (let i=0; i<arr.length; ++i) sum += arr[i];
+  return sum & 0xffff;
+}
+
+// Sende Block im STC-Protokoll
+async function sendBlock(cmdarr) {
+  // cmdarr: Array oder Uint8Array
+  let size = cmdarr.length + 6;
+  let sum = STC_TX_CODE + (size>>8) + (size&0xff);
+  for (let x of cmdarr) sum += x;
+  let block = [
+    STC_PREFIX, STC_PREFIX ^ 0xff, STC_TX_CODE,
+    (size>>8)&0xff, size&0xff,
+    ...cmdarr,
+    (sum>>8)&0xff, sum&0xff,
+    STC_SUFFIX
+  ];
+  await serialWrite(new Uint8Array(block));
+}
+
+// Antwort empfangen & prüfen
+async function recvBlock() {
+  // Erwartet: Prefix, Prefix^0xFF, RX_CODE, Größe (2), Daten, Checksumme (2), Suffix
+  let pre = await serialRead(1);
+  if (!pre || pre[0] !== STC_PREFIX) throw "Prefix falsch!";
+  let px = await serialRead(2);
+  if (!px || px[0] !== (STC_PREFIX ^ 0xff) || px[1] !== STC_RX_CODE) throw "RX-Prefix falsch!";
+  let lenb = await serialRead(2);
+  let size = (lenb[0]<<8) | lenb[1];
+  if (size < 7) throw "Antwort: Länge zu kurz";
+  let data = await serialRead(size - 6);
+  let chk = await serialRead(2);
+  let suff = await serialRead(1);
+  if (suff[0] !== STC_SUFFIX) throw "Suffix falsch!";
+  // Prüfsumme prüfen
+  let sum = STC_RX_CODE + (size>>8) + (size&0xff);
+  for (let x of data) sum += x;
+  let realchk = ((chk[0]<<8)|chk[1]) & 0xffff;
+  if ((sum & 0xffff) !== realchk) throw "Checksumme falsch!";
+  return data;
+}
+
+// ----- Flash-Ablauf -----
+async function stc8Flash() {
+  if (!firmware) { logMsg("Firmware nicht geladen!","#f00"); return; }
+  logMsg("Starte Handshake...","#0ff");
+  // Schritt 1: SYNC senden bis MCU antwortet
+  let found = false;
+  for (let i=0; i<100; ++i) {
+    await serialWrite(new Uint8Array([STC_CHAR_SYNC]));
+    try {
+      let pre = await serialRead(1);
+      if (pre[0] === STC_PREFIX) {
+        found = true;
+        break;
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 100));
+  }
+  if (!found) { logMsg("Keine Antwort von MCU. Powercycle?","#f00"); return; }
+  // Jetzt RX-Protokoll lesen
+  let rest = await serialRead(2); // Prefix^0xff, RX_CODE
+  let lenb = await serialRead(2);
+  let size = (lenb[0]<<8)|lenb[1];
+  let data = await serialRead(size - 6);
+  let chk = await serialRead(2);
+  let suff = await serialRead(1);
+
+  // Gerätekennung extrahieren
+  if (data[0] !== STC_RPL_INFO) { logMsg("Ungültige Antwort, Abbruch!","#f00"); return; }
+  let chipid = (data[20]<<8)|data[21];
+  let dev = DEVICES.find(d => d.id === chipid);
+  if (!dev) { logMsg(`Unbekannter Chip: 0x${chipid.toString(16)}`,"#f00"); return; }
+  flash_size = dev.flash_size;
+  device = dev;
+  logMsg(`Chip gefunden: <b>${dev.name}</b> (${dev.flash_size} Bytes Flash)`, "#0f0");
+
+  // Schritt 2: BAUD auf 115200 setzen
+  logMsg("Setze Baudrate auf 115200...","#0ff");
+  let fosc = (data[1]<<24)|(data[2]<<16)|(data[3]<<8)|data[4];
+  let fisp = (data[13]<<8)|data[14];
+  let baud = 115200;
+  let count = Math.round(65536 - (fisp / (4 * baud)));
+  let baudblock = [
+    STC_CMD_BAUD_SET, data[4], 0x40, 
+    (count>>8)&0xff, count&0xff, 0x00, 0x00, 0x97
+  ];
+  await sendBlock(baudblock);
+  await recvBlock();
+  logMsg("Baudrate gesetzt.", "#0f0");
+  // Kein echter Wechsel im Port-Objekt, weiter 2400 nutzen!
+
+  // Schritt 3: Lösche Flash
+  logMsg("Lösche Flash...","#ff0");
+  await sendBlock([STC_CMD_ERASE, 0, 0, STC_BREAK, STC_BREAK ^ 0xff]);
+  await recvBlock();
+  logMsg("Flash gelöscht.", "#0f0");
+
+  // Schritt 4: Flashen
+  logMsg("Sende Firmware...");
+  let addr = 0;
+  let dataArr = firmware;
+  let cmd = STC_CMD_WRITE;
+  let total = dataArr.length;
+  let pos = 0;
+  while (dataArr.length > 0) {
+    let chunk = dataArr.slice(0, STC_PAGE_SIZE);
+    let block = [
+      cmd, (addr>>8)&0xff, addr&0xff, STC_BREAK, STC_BREAK^0xff, ...chunk
+    ];
+    await sendBlock(block);
+    let resp = await recvBlock();
+    if (resp[0] !== STC_CMD_WRITE_CONT) throw "Flashen fehlgeschlagen!";
+    cmd = STC_CMD_WRITE_CONT;
+    dataArr = dataArr.slice(chunk.length);
+    addr += chunk.length;
+    pos += chunk.length;
+    logMsg(`...${pos}/${total} Bytes übertragen`);
+  }
+  logMsg("Firmware übertragen!","#0f0");
+
+  // Schritt 5: Beenden
+  logMsg("Disconnect.", "#888");
+  await sendBlock([STC_CMD_EXIT]);
+  port.close();
+  logMsg("Fertig.","#fff");
+}
+
+// ----- Button Events -----
+btnPort.addEventListener('click', openPort);
+btnFlash.addEventListener('click', () => {
+  stc8Flash().catch(e => logMsg("FEHLER: " + e, "#f00"));
+});
+
+</script>
+</body>
+</html>
